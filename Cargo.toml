@@ -1,0 +1,20 @@
+[package]
+name = "video_proxy_server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.34", features = ["full", "fs"] }
+hyper = { version = "0.14", features = ["full", "stream"] }
+bytes = "1.5"
+futures = "0.3"
+lru = "0.12"
+tokio-util = { version = "0.7", features = ["codec"] }
+async-trait = "0.1"
+chrono = "0.4"
+semaphore = "0.4"
+url = "2.5"
+tokio-stream = "0.1"
+futures-util = "0.3"
+sha2 = "0.10"
+hex = "0.4"
