@@ -46,7 +46,7 @@ async fn handle_video_stream(
 
 async fn fetch_with_retry(
     client: &Client<hyper::client::HttpConnector>,
-    req: Request<Body>,
+    original_req: Request<Body>,
     retry_count: u32,
 ) -> Result<Response<Body>, ProxyError> {
     let mut current_retry = 0;
@@ -57,10 +57,17 @@ async fn fetch_with_retry(
             // 指数退避策略：每次重试延迟时间翻倍
             let delay = RETRY_DELAY * (2_u32.pow(current_retry - 1));
             tokio::time::sleep(delay).await;
-            println!("重试请求 {}/{}, URI: {}", current_retry, retry_count, req.uri());
+            println!("重试请求 {}/{}, URI: {}", current_retry, retry_count, original_req.uri());
         }
 
-        match timeout(REQUEST_TIMEOUT, client.request(req.try_clone().unwrap())).await {
+        // 为每次重试创建新的请求
+        let req = Request::builder()
+            .method(original_req.method())
+            .uri(original_req.uri())
+            .body(Body::empty())
+            .unwrap();
+
+        match timeout(REQUEST_TIMEOUT, client.request(req)).await {
             Ok(result) => {
                 match result {
                     Ok(response) => {
@@ -80,7 +87,8 @@ async fn fetch_with_retry(
         current_retry += 1;
     }
 
-    Err(last_error.unwrap_or(ProxyError::NetworkError(hyper::Error::new_canceled())))
+    // 使用最后一个错误，或者默认为超时错误
+    Err(last_error.unwrap_or(ProxyError::Timeout))
 }
 
 pub async fn handle_request(
