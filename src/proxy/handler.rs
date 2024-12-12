@@ -1,12 +1,17 @@
 use crate::cache::{Cache, CacheItem};
-use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
-use hyper::{Body, Client, Request, Response, StatusCode};
-use hyper::header::{HeaderValue, CONTENT_TYPE, RANGE, CONTENT_LENGTH, CONTENT_RANGE, HeaderMap};
+use bytes::Bytes;
+use http::StatusCode;
+use http::header::{CONTENT_TYPE, RANGE, CONTENT_LENGTH, CONTENT_RANGE};
+use hyper::body::Incoming;
+use hyper::{Request, Response, Method, Uri};
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use http_body_util::{BodyExt, Full};
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
+use std::fmt;
+use std::error::Error;
 
 // 默认超时时间（10秒）
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -14,263 +19,201 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRIES: u32 = 3;
 // 重试延迟（基础值，会随重试次数增加）
 const RETRY_DELAY: Duration = Duration::from_millis(500);
-// 预加载大小（1MB）
-const PRELOAD_SIZE: u64 = 1024 * 1024;
 
 pub type SharedCache = Arc<RwLock<Cache>>;
 
 #[derive(Debug)]
-enum ProxyError {
+pub enum ProxyError {
     Timeout,
-    NetworkError(hyper::Error),
+    NetworkError(Box<dyn Error + Send + Sync>),
     StatusError(StatusCode),
+}
+
+impl fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProxyError::Timeout => write!(f, "Request timeout"),
+            ProxyError::NetworkError(e) => write!(f, "Network error: {}", e),
+            ProxyError::StatusError(status) => write!(f, "HTTP error: {}", status),
+        }
+    }
+}
+
+impl Error for ProxyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ProxyError::NetworkError(e) => Some(e.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 impl From<hyper::Error> for ProxyError {
     fn from(err: hyper::Error) -> Self {
-        ProxyError::NetworkError(err)
+        ProxyError::NetworkError(Box::new(err))
     }
-}
-
-// 新增：表示部分加载的视频数据
-#[derive(Clone)]
-struct PartialVideoData {
-    data: Bytes,
-    content_type: String,
-    total_size: u64,
-    loaded_range: (u64, u64),
-}
-
-async fn handle_video_stream(
-    client_response: Response<Body>,
-    range: Option<(u64, u64)>,
-) -> Result<(Bytes, u64), ProxyError> {
-    let total_size = client_response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-
-    let mut body = BytesMut::new();
-    let mut stream = client_response.into_body();
-    let mut bytes_received = 0u64;
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(ProxyError::NetworkError)?;
-        bytes_received += chunk.len() as u64;
-        
-        // 如果指定了范围且已达到结束位置，停止加载
-        if let Some((_, end)) = range {
-            if bytes_received > end {
-                break;
-            }
-        }
-        
-        body.extend_from_slice(&chunk);
-    }
-
-    Ok((body.freeze(), total_size))
-}
-
-fn create_request(
-    method: &hyper::Method,
-    uri: &hyper::Uri,
-    headers: &HeaderMap,
-    range: Option<(u64, u64)>,
-) -> Request<Body> {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(uri);
-
-    // 复制原始请求的相关头部
-    for (key, value) in headers.iter() {
-        if key != RANGE {  // 不复制 Range 头，因为我们要自己设置
-            builder = builder.header(key, value);
-        }
-    }
-
-    // 如果有范围要求，添加 Range 头部
-    if let Some((start, end)) = range {
-        builder = builder.header(RANGE, format!("bytes={}-{}", start, end));
-    }
-
-    builder.body(Body::empty()).unwrap()
-}
-
-async fn fetch_with_retry(
-    client: &Client<hyper::client::HttpConnector>,
-    original_req: &Request<Body>,
-    range: Option<(u64, u64)>,
-    retry_count: u32,
-) -> Result<Response<Body>, ProxyError> {
-    let mut current_retry = 0;
-    let mut last_error = None;
-
-    while current_retry <= retry_count {
-        if current_retry > 0 {
-            let delay = RETRY_DELAY * (2_u32.pow(current_retry - 1));
-            tokio::time::sleep(delay).await;
-            println!("重试请求 {}/{}, URI: {}", current_retry, retry_count, original_req.uri());
-        }
-
-        let req = create_request(
-            original_req.method(),
-            original_req.uri(),
-            original_req.headers(),
-            range,
-        );
-
-        match timeout(REQUEST_TIMEOUT, client.request(req)).await {
-            Ok(result) => {
-                match result {
-                    Ok(response) => {
-                        let status = response.status();
-                        if status.is_success() || status == StatusCode::PARTIAL_CONTENT {
-                            return Ok(response);
-                        } else {
-                            last_error = Some(ProxyError::StatusError(status));
-                        }
-                    }
-                    Err(e) => last_error = Some(ProxyError::NetworkError(e)),
-                }
-            }
-            Err(_) => last_error = Some(ProxyError::Timeout),
-        }
-
-        current_retry += 1;
-    }
-
-    Err(last_error.unwrap_or(ProxyError::Timeout))
 }
 
 pub async fn handle_request(
-    req: Request<Body>,
+    req: Request<Incoming>,
     cache: SharedCache,
-    client: Client<hyper::client::HttpConnector>,
+    client: Client<HttpConnector, Full<Bytes>>,
     semaphore: Arc<Semaphore>,
-) -> Result<Response<Body>, hyper::Error> {
-    let _permit = semaphore.acquire().await.unwrap();
-    let uri = req.uri().to_string();
-    
-    // 解析客户端请求的范围
-    let client_range = req.headers()
-        .get(RANGE)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| {
-            let parts: Vec<&str> = s.trim_start_matches("bytes=").split('-').collect();
-            if parts.len() == 2 {
-                let start = parts[0].parse::<u64>().ok()?;
-                let end = parts[1].parse::<u64>().ok()?;
-                Some((start, end))
-            } else {
-                None
-            }
-        });
+) -> Result<Response<Full<Bytes>>, Box<dyn Error + Send + Sync>> {
+    // 获取信号量许可
+    let _permit = semaphore.acquire().await?;
 
-    // 检查缓存
-    if let Some(cached_item) = cache.write().await.get(&uri).await {
-        println!("缓存命中: {}", uri);
-        
-        // 如果客户端请求特定范围，返回相应部分
-        if let Some((start, end)) = client_range {
-            let mut response = Response::new(Body::from(
-                cached_item.data.slice(start as usize..std::cmp::min(end as usize + 1, cached_item.data.len()))
-            ));
-            response.headers_mut().insert(
-                CONTENT_TYPE,
-                HeaderValue::from_str(&cached_item.content_type).unwrap(),
-            );
-            response.headers_mut().insert(
-                CONTENT_RANGE,
-                HeaderValue::from_str(&format!("bytes {}-{}/{}", 
-                    start, 
-                    std::cmp::min(end, cached_item.data.len() as u64 - 1),
-                    cached_item.data.len()
-                )).unwrap(),
-            );
-            response.headers_mut().insert(
-                CONTENT_LENGTH,
-                HeaderValue::from_str(&format!("{}", 
-                    std::cmp::min(end - start + 1, cached_item.data.len() as u64 - start)
-                )).unwrap(),
-            );
-            return Ok(response);
+    // 处理请求
+    match handle_video_stream(req, cache, client).await {
+        Ok(response) => Ok(response),
+        Err(e) => {
+            eprintln!("Error handling video stream: {:?}", e);
+            let response = Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::new()))?;
+            Ok(response)
         }
-        
-        let mut response = Response::new(Body::from(cached_item.data));
-        response.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_str(&cached_item.content_type).unwrap(),
-        );
-        return Ok(response);
+    }
+}
+
+async fn handle_video_stream(
+    req: Request<Incoming>,
+    cache: SharedCache,
+    client: Client<HttpConnector, Full<Bytes>>,
+) -> Result<Response<Full<Bytes>>, Box<dyn Error + Send + Sync>> {
+    let uri = req.uri().clone();
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+
+    // 只处理 GET 请求
+    if method != Method::GET {
+        return Ok(Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Full::new(Bytes::new()))?);
     }
 
-    println!("缓存未命中，从源站获取: {}", uri);
-    
-    // 首次请求只获取预加载部分
-    let initial_range = Some((0, PRELOAD_SIZE - 1));
-    let source_response = match fetch_with_retry(&client, &req, initial_range, MAX_RETRIES).await {
-        Ok(response) => response,
-        Err(err) => {
-            println!("请求失败 {}: {:?}", uri, err);
-            return Ok(Response::builder()
-                .status(match err {
-                    ProxyError::Timeout => StatusCode::GATEWAY_TIMEOUT,
-                    ProxyError::NetworkError(_) => StatusCode::BAD_GATEWAY,
-                    ProxyError::StatusError(status) => status,
-                })
-                .body(Body::empty())
-                .unwrap());
-        }
-    };
+    // 从缓存中获取数据
+    let cache_key = uri.to_string();
+    let mut cache_read = cache.write().await;
+    if let Some(cache_item) = cache_read.get(&cache_key).await {
+        // 处理 Range 请求
+        if let Some(range_header) = headers.get(RANGE) {
+            if let Ok(range_str) = range_header.to_str() {
+                if let Some((start, end)) = parse_range(range_str, cache_item.data.len()) {
+                    let data = cache_item.data.slice(start..end + 1);
+                    let content_length = end - start + 1;
+                    let content_range = format!("bytes {}-{}/{}", start, end, cache_item.data.len());
 
-    let content_type = source_response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-
-    // 处理视频流
-    let (video_data, total_size) = match handle_video_stream(source_response, initial_range).await {
-        Ok(data) => data,
-        Err(err) => {
-            println!("处理视频流失败 {}: {:?}", uri, err);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::empty())
-                .unwrap());
+                    return Ok(Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(CONTENT_TYPE, &cache_item.content_type)
+                        .header(CONTENT_LENGTH, content_length.to_string())
+                        .header(CONTENT_RANGE, content_range)
+                        .body(Full::new(data))?);
+                }
+            }
         }
-    };
-    
-    // 存入缓存
-    let cache_item = CacheItem {
-        data: video_data.clone(),
-        content_type: content_type.clone(),
-        expires_at: SystemTime::now() + Duration::from_secs(3600),
-        size: video_data.len(),
-    };
-    
-    cache.write().await.put(uri, cache_item).await;
-    
+
+        // 返回完整响应
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, &cache_item.content_type)
+            .header(CONTENT_LENGTH, cache_item.data.len().to_string())
+            .body(Full::new(cache_item.data.clone()))?);
+    }
+    drop(cache_read);
+
+    // 如果缓存中没有，从源服务器获取
+    let (status, headers, body_bytes) = fetch_with_retry(&client, &uri).await?;
+
+    // 如果是成功的响应，则缓存
+    if status.is_success() {
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        let cache_item = CacheItem {
+            data: body_bytes.clone(),
+            content_type,
+            expires_at: SystemTime::now() + Duration::from_secs(3600),
+            size: body_bytes.len(),
+        };
+
+        let mut cache_write = cache.write().await;
+        cache_write.put(cache_key, cache_item).await;
+        drop(cache_write);
+    }
+
     // 构建响应
-    let mut response = Response::new(Body::from(video_data));
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_str(&content_type).unwrap(),
-    );
-    response.headers_mut().insert(
-        CONTENT_RANGE,
-        HeaderValue::from_str(&format!("bytes 0-{}/{}", 
-            PRELOAD_SIZE - 1,
-            total_size
-        )).unwrap(),
-    );
-    response.headers_mut().insert(
-        CONTENT_LENGTH,
-        HeaderValue::from_str(&PRELOAD_SIZE.to_string()).unwrap(),
-    );
-    
-    Ok(response)
+    let mut response_builder = Response::builder().status(status);
+    for (key, value) in headers.iter() {
+        response_builder = response_builder.header(key, value);
+    }
+
+    Ok(response_builder.body(Full::new(body_bytes))?)
+}
+
+async fn fetch_with_retry(
+    client: &Client<HttpConnector, Full<Bytes>>,
+    uri: &Uri,
+) -> Result<(StatusCode, http::HeaderMap, Bytes), Box<dyn Error + Send + Sync>> {
+    let mut retry_count = 0;
+    let mut last_error = None;
+
+    while retry_count < MAX_RETRIES {
+        let request = Request::builder()
+            .uri(uri)
+            .method(Method::GET)
+            .body(Full::new(Bytes::new()))?;
+
+        match timeout(REQUEST_TIMEOUT, client.request(request)).await {
+            Ok(result) => match result {
+                Ok(response) => {
+                    let status = response.status();
+                    let headers = response.headers().clone();
+                    if status.is_success() {
+                        let body_bytes = collect_body(response).await?;
+                        return Ok((status, headers, body_bytes));
+                    }
+                    last_error = Some(ProxyError::StatusError(status));
+                }
+                Err(e) => last_error = Some(ProxyError::NetworkError(Box::new(e))),
+            },
+            Err(_) => last_error = Some(ProxyError::Timeout),
+        }
+
+        retry_count += 1;
+        if retry_count < MAX_RETRIES {
+            tokio::time::sleep(RETRY_DELAY * retry_count).await;
+        }
+    }
+
+    Err(Box::new(last_error.unwrap()))
+}
+
+async fn collect_body(response: Response<Incoming>) -> Result<Bytes, Box<dyn Error + Send + Sync>> {
+    let body = response.into_body();
+    let collected = body.collect().await?;
+    Ok(collected.to_bytes())
+}
+
+fn parse_range(range_str: &str, total_size: usize) -> Option<(usize, usize)> {
+    if let Some(range_value) = range_str.strip_prefix("bytes=") {
+        let parts: Vec<&str> = range_value.split('-').collect();
+        if parts.len() == 2 {
+            let start = parts[0].parse::<usize>().ok()?;
+            let end = if parts[1].is_empty() {
+                total_size - 1
+            } else {
+                parts[1].parse::<usize>().ok()?
+            };
+
+            if start <= end && end < total_size {
+                return Some((start, end));
+            }
+        }
+    }
+    None
 }

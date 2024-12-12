@@ -1,5 +1,4 @@
 use super::{CacheItem, DiskCache, MAX_MEMORY_CACHE_SIZE};
-use bytes::Bytes;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime};

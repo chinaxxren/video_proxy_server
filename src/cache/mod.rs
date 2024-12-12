@@ -5,7 +5,7 @@ pub use memory_cache::*;
 pub use disk_cache::*;
 
 use bytes::Bytes;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 pub const MAX_MEMORY_CACHE_SIZE: usize = 100 * 1024 * 1024; // 100MB
 pub const CACHE_DIR: &str = "video_cache";

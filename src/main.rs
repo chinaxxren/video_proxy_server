@@ -1,23 +1,14 @@
-use video_proxy_server::proxy::ProxyServer;
 use std::net::SocketAddr;
-
-// 默认配置
-const DEFAULT_PORT: u16 = 3000;
-// 默认缓存容量 
-const DEFAULT_CACHE_CAPACITY: usize = 100;
-// 默认最大连接数
-const DEFAULT_MAX_CONNECTIONS: usize = 50;
+use video_proxy_server::proxy::server::ProxyServer;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT));
-    let server = ProxyServer::new(
-        addr, 
-        DEFAULT_CACHE_CAPACITY, 
-        DEFAULT_MAX_CONNECTIONS
-    ).await?;
-    
-    println!("启动视频代理服务器...");
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr: SocketAddr = "127.0.0.1:3000".parse()?;
+    let cache_capacity = 100; // 缓存容量
+    let max_connections = 100; // 最大并发连接数
+
+    let server = ProxyServer::new(addr, cache_capacity, max_connections).await?;
     server.run().await?;
+
     Ok(())
 }
